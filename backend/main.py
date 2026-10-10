@@ -8,6 +8,9 @@ from dotenv import load_dotenv
 from pgvector.psycopg2 import register_vector
 from pgvector import Vector
 from pathlib import Path
+from pwdlib import PasswordHash
+
+password_hash = PasswordHash.recommended()
 
 env_path = Path(__file__).parent / ".env"
 load_dotenv(env_path)
@@ -40,6 +43,16 @@ class SearchRequest(BaseModel):
 class StudentRequest(BaseModel):
     name: str
     email: str    
+
+class SignupRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
 class CourseRequest(BaseModel):
     course_name: str
 class TopicRequest(BaseModel):
@@ -438,13 +451,11 @@ class QuizAttemptRequest(BaseModel):
     topic_id: int
     score: int | None = None
 
-
 @app.post("/quiz/attempt")
 def store_quiz_attempt(request: QuizAttemptRequest):
 
     connection = get_connection()
     cursor = connection.cursor()
-
     try:
         # Check that the student exists
         cursor.execute("""
@@ -2587,6 +2598,130 @@ def get_learner_events(
         raise HTTPException(
             status_code=500,
             detail="Failed to fetch learner events"
+        )
+
+    finally:
+        cursor.close()
+        connection.close()
+
+@app.post("/auth/signup")
+def signup(request: SignupRequest):
+    name = request.name.strip()
+    email = request.email.strip().lower()
+
+    if not name or not email:
+        raise HTTPException(
+            status_code=400,
+            detail="Name and email are required"
+        )
+
+    if len(request.password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters"
+        )
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    try:
+        # Check whether this email already exists
+        cursor.execute(
+            "SELECT student_id FROM students WHERE email = %s",
+            (email,)
+        )
+
+        if cursor.fetchone() is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Email is already registered"
+            )
+
+        # Hash the password before storing it
+        hashed_password = password_hash.hash(request.password)
+
+        cursor.execute("""
+            INSERT INTO students (name, email, password_hash)
+            VALUES (%s, %s, %s)
+            RETURNING student_id, name, email;
+        """, (name, email, hashed_password))
+
+        student = cursor.fetchone()
+        connection.commit()
+
+        return {
+            "message": "Signup successful",
+            "student_id": student[0],
+            "name": student[1],
+            "email": student[2]
+        }
+
+    except HTTPException:
+        connection.rollback()
+        raise
+
+    except psycopg2.errors.UniqueViolation:
+        connection.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Email is already registered"
+        )
+
+    except Exception:
+        connection.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Signup failed"
+        )
+
+    finally:
+        cursor.close()
+        connection.close()
+
+@app.post("/auth/login")
+def login(request: LoginRequest):
+    email = request.email.strip().lower()
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    try:
+        cursor.execute("""
+            SELECT student_id, name, email, password_hash
+            FROM students
+            WHERE email = %s;
+        """, (email,))
+
+        student = cursor.fetchone()
+
+        # Old student records may not have a password hash
+        if (
+            student is None
+            or student[3] is None
+            or not password_hash.verify(
+                request.password,
+                student[3]
+            )
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid email or password"
+            )
+
+        return {
+            "message": "Login successful",
+            "student_id": student[0],
+            "name": student[1],
+            "email": student[2]
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Login failed"
         )
 
     finally:
